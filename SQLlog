@@ -1,0 +1,698 @@
+--- CLEANING ---
+  select 
+		order_id,
+		customer_id,
+		pizza_id,
+		case 
+			when exclusions = '' then NULL
+			when exclusions = 'null' then NULL
+		else exclusions
+		end as exclusions_cleaned,
+		case	
+			when extras = '' then NULL
+			when extras = 'null' then NULL
+		else extras
+		end as extras_cleaned,
+		order_time
+  into temp_customer_orders
+  from customer_orders;
+
+DROP TABLE IF EXISTS temp_runner_orders;
+select 
+		order_id,
+		runner_id,
+		case	
+			when pickup_time = '' then NULL
+			when pickup_time = 'null' then NULL
+		else pickup_time
+		end as pickup_time_cleaned,
+		case when distance = 'null' then NULL else cast(replace(distance, 'km', '') as decimal(18,2)) end as distance_km,
+		case 
+             when duration = 'null' then NULL 
+             else CAST(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(duration, ' minutes', ''), ' minute', ''), ' mins', ''), ' min', ''), 'minutes',''), 'minute',''),'mins',''),'min','') AS DECIMAL(18,2))
+        end as duration_mins,
+		case
+			when cancellation = '' then NULL
+			when cancellation = 'null' then NULL
+		else cancellation end as cancellation
+into temp_runner_orders
+from runner_orders 
+--- PIZZA METRIC ---
+--- HOW MANY PIZZAS WERE ORDER
+select 
+	count(*) as total_pizzas_ordered
+from temp_customer_orders
+--- HOW MANY UNIQUE CUSTOMER WERE MADE
+select 
+	count(distinct customer_id) as number_of_unique_customer
+from temp_customer_orders
+--- HOW MANY SUCCESSFUL CUSTOMER WERE DELIVERED --- 
+select 
+	count(distinct c.customer_id) as customer_delivered
+from temp_runner_orders as r
+left join temp_customer_orders as c on r.order_id = c.order_id 
+where cancellation is NULL
+--- HOW MANY SUCCESSFUL ORDER DELIVERED BY EACH RUNNER
+select 
+	distinct (runner_id), count (order_id) over (partition by runner_id) as successfully_delivered
+from temp_runner_orders
+where cancellation is null
+--- HOW MANY OF EACH TYPE OF PIZZA WERE DELIVERED
+select 
+	distinct(c.pizza_id), count(c.order_id) over (partition by pizza_id) as numof_delivered
+from temp_customer_orders as c
+left join temp_runner_orders as r on c.order_id = r.order_id
+where cancellation is null
+--- HOW MANY VET / MEAT ORDERED BY EACH CUSTOMER
+select 
+	distinct(customer_id),
+	count(case when pizza_id = 1 then pizza_id end) over (partition by customer_id) as meatlover_ordered,
+	count(case when pizza_id = 2 then pizza_id end) over (partition by customer_id) as vet_ordered
+from temp_customer_orders
+--- What was the maximum number of pizzas delivered in a single order?
+select 
+	max(pizza_ordered) as max_ordered
+from (select distinct order_id, (count(pizza_id) over (partition by order_id)) as pizza_ordered
+	 from temp_customer_orders) as order_counts;
+--- For each customer, how many delivered pizzas had at least 1 change and how many had no changes?
+select distinct 
+	c.customer_id,  
+	count (case when c.exclusions_cleaned is null and c.extras_cleaned is null then pizza_id end) over (partition by c.customer_id) as og_pizza,
+	count (case when c.exclusions_cleaned is not null or c.extras_cleaned is not null then pizza_id end) over (partition by c.customer_id) as ch_pizza
+from temp_customer_orders c
+left join temp_runner_orders r on c.order_id = r.order_id
+where cancellation is null
+--- How many pizzas were delivered that had both exclusions and extras?
+select 
+	count (case when c.exclusions_cleaned is not null and c.extras_cleaned is not null then pizza_id end) as double_ch_pizza
+from temp_customer_orders c
+left join temp_runner_orders r on c.order_id = r.order_id
+where cancellation is null;
+--- What was the total volume of pizzas ordered for each hour of the day?
+
+select 
+	distinct DATEPART (hour,order_time) as hr,
+	count (order_id) over (partition by DATEPART (hour,order_time)) as order_count
+from temp_customer_orders
+
+
+SELECT 
+    DATEPART(YEAR, order_time) AS order_year,
+    DATEPART(MONTH, order_time) AS order_month,
+    DATEPART(DAY, order_time) AS order_day,
+    DATEPART(HOUR, order_time) AS order_hour,
+    COUNT(pizza_id) AS pizza_count
+FROM 
+    temp_customer_orders
+GROUP BY 
+    DATEPART(YEAR, order_time),
+    DATEPART(MONTH, order_time),
+    DATEPART(DAY, order_time),
+    DATEPART(HOUR, order_time)
+ORDER BY 
+    order_year, order_month, order_day, order_hour;
+
+----What was the volume of orders for each day of the week?
+SELECT 
+  	DATEPART(WEEK, order_time) as week_number,
+    DATENAME(WEEKDAY, order_time) AS day_of_week,
+	count(pizza_id) as pizza_count
+FROM temp_customer_orders
+group by DATEPART(WEEK, order_time),DATENAME(WEEKDAY, order_time)
+order by week_number, day_of_week
+
+---B. Runner and Customer Experience
+---How many runners signed up for each 1 week period? (i.e. week starts 2021-01-01)
+SET DATEFIRST 1;
+select
+	datepart(week, registration_date) as week_number,
+	count (runner_id) as no_reg
+from runners
+group by datepart(week, registration_date)
+
+select	 
+	datename (weekday, registration_date) as day_of_week
+from runners
+
+--- What was the average time in minutes it took for each runner to arrive at the Pizza Runner HQ to pickup the order?
+select runner_id, AVG(time_arrived_minute) as avg_arrived_time
+from (select
+	distinct c.order_id,
+	runner_id,
+	datediff(minute, c.order_time,r.pickup_time_cleaned) as time_arrived_minute
+from temp_customer_orders c
+left join temp_runner_orders r on c.order_id = r.order_id
+where cancellation is null) as time_arrived
+group by runner_id;
+--- What was the average time in minutes it took for each runner to arrive at the Pizza Runner HQ to pickup the order?
+select
+	distinct c.order_id, 
+	count(pizza_id) over (partition by c.order_id) as number_of_pizza,
+	datediff(minute, c.order_time,r.pickup_time_cleaned) as prep_time
+from temp_customer_orders c
+left join temp_runner_orders r on c.order_id = r.order_id
+where cancellation is null
+--- "there is possible relationship, but it's unclear. 
+--- Because although it seems like the more pizzas needed to be made the more time needed. 
+--- But there are 2 special cases as order_id no.8 when 1 pizza costs 21 mins and order_id no.10 2 pizza only cost 16 mins.
+
+---What was the average distance travelled for each customer?
+select r.customer_id, avg(distance_km) as avg_distance_customer
+from temp_runner_orders c
+left join temp_customer_orders r on c.order_id = r.order_id
+group by r.customer_id
+
+--- What was the difference between the longest and shortest delivery times for all orders?
+select (max(duration_mins)-min(duration_mins)) as diff
+from temp_runner_orders
+--- What was the average speed for each runner for each delivery and do you notice any trend for these values?
+select 
+	runner_id,
+	AVG(speed_km_per_hour) as speed
+from
+(select 
+	distinct c.order_id,
+	r.runner_id,
+	distance_km,
+	(distance_km/duration_mins*60) as speed_km_per_hour
+from temp_runner_orders r
+left join temp_customer_orders c on c.order_id = r.order_id
+where cancellation is null) as speed
+group by runner_id
+
+select 
+	distinct c.order_id,
+	r.runner_id,
+	distance_km,
+	(distance_km/duration_mins*60) as speed_km_per_hour
+from temp_runner_orders r
+left join temp_customer_orders c on c.order_id = r.order_id
+where cancellation is null
+order by runner_id
+--- seems like mr.1 and mr.2 run faster as time goes by 
+
+--- What is the successful delivery percentage for each runner?
+select 
+	runner_id,
+	f as failed,
+	s as succeeded,
+	(cast(s as float) / (s + f)) * 100 as ratio
+from
+(select 
+	runner_id, 
+	count(case when distance_km is null then runner_id end) as f,
+	count(case when distance_km is not null then runner_id end) as s
+from temp_runner_orders
+group by runner_id) as record
+--- C. Ingridient Optimisation
+---What are the standard ingredients for each pizza?
+
+---reformat pizza toppings
+alter table pizza_recipes
+ALTER COLUMN toppings VARCHAR(MAX);
+
+DROP TABLE IF EXISTS splitted_pizza_id;
+select pizza_id,value as topping_id
+into splitted_pizza_id
+from pizza_recipes p
+cross apply string_split(toppings,',')
+
+select s.pizza_id, p.topping_name
+from splitted_pizza_id s
+left join pizza_toppings p on s.topping_id = p.topping_id
+
+--- what is the most commonly added extra
+with splitted_value as 
+(
+select extras_cleaned,value as topping_id
+from (
+select extras_cleaned,cast(extras_cleaned as varchar(max)) as et
+from temp_customer_orders
+where extras_cleaned is not null) as toppings 
+cross apply string_split(et,',')
+)
+select topping_id,COUNT(*) as frequency
+from splitted_value 
+group by topping_id
+order by count(*) desc
+
+--- select Value?
+
+--- what is the most commonly added extra
+with splitted_value as 
+(
+select exclusions_cleaned,value as topping_id
+from (
+select exclusions_cleaned,cast(exclusions_cleaned as varchar(max)) as et
+from temp_customer_orders
+where exclusions_cleaned is not null) as toppings 
+cross apply string_split(et,',')
+)
+select topping_id,COUNT(*) as frequency
+from splitted_value 
+group by topping_id
+order by count(*) desc
+
+
+---Generate an order item for each record in the customers_orders table in the format of one of the following:
+--- step 1: whenever the order id get 1 means meatlovers and 2 means vet
+--- step 2: if non then done, if extra is not null the add "extra" and convert ingredient in to name, same happen with exclude.
+---step 0: creat special id for each pizza in the any order
+ALTER TABLE temp_customer_orders
+ADD special_id INT;
+DECLARE @counter INT = 0;
+UPDATE temp_customer_orders
+SET @counter = special_id = @counter + 1;
+---step 1:
+DROP TABLE IF EXISTS pizza_names_by_order;
+select order_id,special_id,pizza_name
+into pizza_names_by_order
+from temp_customer_orders c
+left join pizza_names p on c.pizza_id = p.pizza_id
+
+---step 2:
+---step 2.1: Exclusion 
+DROP TABLE IF EXISTS exclusions_by_order;
+With exlcusions_splitted as 
+(SELECT 
+	order_id,
+	special_id,
+    CASE 
+        WHEN CHARINDEX(',', exclusions_cleaned) > 0 THEN SUBSTRING(exclusions_cleaned, 1, CHARINDEX(',', exclusions_cleaned) - 1)
+        ELSE exclusions_cleaned
+    END AS EXL1,
+    CASE 
+        WHEN CHARINDEX(',', exclusions_cleaned) > 0 THEN SUBSTRING(exclusions_cleaned, CHARINDEX(',', exclusions_cleaned) + 1, LEN(exclusions_cleaned) - CHARINDEX(',', exclusions_cleaned))
+        ELSE NULL
+    END AS EXL2
+FROM 
+    temp_customer_orders)
+Select order_id, special_id, pt.topping_name as excluded_1, pt1.topping_name as excluded_2
+into exclusions_by_order
+from exlcusions_splitted es
+left join pizza_toppings pt on es.EXL1 =  pt.topping_id
+left join pizza_toppings pt1 on es.EXL2 = pt1.topping_id
+
+---srep 2.2
+DROP TABLE IF EXISTS extra_by_order;
+With extra_splitted as 
+(SELECT 
+	order_id,
+	special_id,
+    CASE 
+        WHEN CHARINDEX(',', extras_cleaned) > 0 THEN SUBSTRING(extras_cleaned, 1, CHARINDEX(',', extras_cleaned) - 1)
+        ELSE extras_cleaned
+    END AS EXT1,
+    CASE 
+        WHEN CHARINDEX(',', extras_cleaned) > 0 THEN SUBSTRING(extras_cleaned, CHARINDEX(',', extras_cleaned) + 1, LEN(extras_cleaned) - CHARINDEX(',', extras_cleaned))
+        ELSE NULL
+    END AS EXT2
+FROM 
+    temp_customer_orders)
+Select order_id, special_id, pt.topping_name as extra_1, pt1.topping_name as extra_2
+into Extra_by_order
+from extra_splitted es
+left join pizza_toppings pt on es.EXT1 =  pt.topping_id
+left join pizza_toppings pt1 on es.EXT2 = pt1.topping_id
+
+DROP TABLE IF EXISTS order_item;
+with Order_Item As(
+select 
+	p.order_id, 
+	p.special_id, 
+	p.pizza_name, 
+	x.extra_1, 
+	x.extra_2,
+	e.excluded_1, 
+	e.excluded_2
+from pizza_names_by_order p
+left join Extra_by_order x on p.special_id = x.special_id
+left join exclusions_by_order e on p.special_id = e.special_id
+)
+SELECT
+	order_id, 
+	special_id, 
+	pizza_name,
+    CASE 
+        WHEN extra_1 IS NOT NULL OR extra_2 IS NOT NULL THEN CONCAT('Extra ', COALESCE(extra_1, ''), 
+             CASE 
+                 WHEN extra_1 IS NOT NULL AND extra_2 IS NOT NULL THEN ', '
+                 ELSE ''
+             END, COALESCE(extra_2, ''))
+        ELSE Null
+    END AS extra_combined,
+    CASE 
+        WHEN excluded_1 IS NOT NULL OR excluded_2 IS NOT NULL THEN CONCAT('Exclude ', COALESCE(excluded_1, ''),
+             CASE 
+                 WHEN excluded_1 IS NOT NULL AND excluded_2 IS NOT NULL THEN ', '
+                 ELSE ''
+             END, COALESCE(excluded_2, ''))
+        ELSE null
+    END AS excluded_combined
+Into order_item
+FROM Order_Item;
+
+select 
+	o.order_id, 
+	o.special_id, 
+	case 
+		when extra_combined is not null and excluded_combined is not null then concat(o.pizza_name,' - ',o.extra_combined, ' - ',o.excluded_combined)
+		when extra_combined is not null and excluded_combined is null then CONCAT(o.pizza_name,' - ',o.extra_combined)
+		when extra_combined is null and excluded_combined is not null then CONCAT(o.pizza_name,' - ',o.excluded_combined)
+		else o.pizza_name 
+	end as order_items
+from order_item o
+
+---Generate an alphabetically ordered comma separated ingredient list for each pizza order 
+---from the customer_orders table and add a 2x in front of any relevant ingredients
+---For example: "Meat Lovers: 2xBacon, Beef, ... , Salami"
+drop table if exists pizza_recipes_name
+select s.pizza_id, n.pizza_name,t.topping_id,t.topping_name
+into pizza_recipes_name
+from splitted_pizza_id s
+left join pizza_toppings t on s.topping_id = t.topping_id
+left join pizza_names n on s.pizza_id = n.pizza_id
+order by s.pizza_id, t.topping_id
+
+ALTER TABLE pizza_recipes_name
+ALTER COLUMN pizza_id VARCHAR(MAX);
+
+ALTER TABLE pizza_recipes_name
+ALTER COLUMN pizza_name VARCHAR(MAX);
+
+ALTER TABLE pizza_recipes_name
+ALTER COLUMN topping_id VARCHAR(MAX);
+
+ALTER TABLE pizza_recipes_name
+ALTER COLUMN topping_name VARCHAR(MAX);
+
+--- creat function slpit to table
+CREATE FUNCTION dbo.SplitToTable (@InputString NVARCHAR(MAX), @Delimiter NVARCHAR(255))
+RETURNS @Result TABLE (Value NVARCHAR(MAX))
+AS
+BEGIN
+    DECLARE @DelimiterPosition INT
+    DECLARE @Value NVARCHAR(MAX)
+
+    WHILE CHARINDEX(@Delimiter, @InputString) > 0
+    BEGIN
+        SET @DelimiterPosition = CHARINDEX(@Delimiter, @InputString)
+        SET @Value = SUBSTRING(@InputString, 1, @DelimiterPosition - 1)
+        INSERT INTO @Result (Value) VALUES (@Value)
+        SET @InputString = SUBSTRING(@InputString, @DelimiterPosition + LEN(@Delimiter), LEN(@InputString) - @DelimiterPosition)
+    END
+
+    INSERT INTO @Result (Value) VALUES (@InputString)
+
+    RETURN
+END
+
+select 
+	t.order_id,
+	t.special_id,
+	t.pizza_id,
+	s.Value as exclusion,
+	sa.Value as extra
+from temp_customer_orders as t
+outer apply
+	dbo.SplitToTable(t.exclusions_cleaned, ',') s
+outer apply
+	dbo.SplitToTable(t.extras_cleaned, ',') sa
+
+
+
+with CTE_customer_order as
+(select 
+	t.order_id,
+	t.special_id,
+	t.pizza_id,
+	e.Value as exclusion,
+	sa.Value as extra
+from temp_customer_orders as t
+outer apply
+	string_split(t.exclusions_cleaned,',') e
+outer apply
+	string_split(t.extras_cleaned, ',') sa)
+select 
+	c.order_id,
+	c.special_id,
+	c.pizza_id,
+	r.toppings,
+	e.value as single_ingre,
+	c.exclusion,
+	c.extra
+---into cus_splited_ingre
+from CTE_customer_order c
+left join pizza_recipes r on c.pizza_id = r.pizza_id
+outer apply
+	string_split(r.toppings,',') e
+order by order_id, special_id
+
+
+select *
+from cus_splited_ingre
+
+with CTE_ingre_count as
+(select 
+	c.order_id,
+	c.special_id,
+	c.pizza_id,
+	t.topping_name as single_ingredient,
+	t1.topping_name as exclusion,
+	t2.topping_name as extra
+from cus_splited_ingre c
+left join pizza_toppings t on c.single_ingre = t.topping_id
+left join pizza_toppings t1 on c.exclusion = t1.topping_id
+left join pizza_toppings t2 on c.extra = t2.topping_id)
+select
+	c.order_id,
+	c.special_id,
+	c.pizza_id,
+	c.single_ingredient,
+	c.exclusion,
+	c.extra,
+	case
+		when c.single_ingredient = c.extra then concat ('2x ',c.single_ingredient)
+		when c.single_ingredient = c.exclusion then null
+		else c.single_ingredient
+	end as i_count
+----into i_count
+from CTE_ingre_count c
+where special_id = '14'
+	
+select 
+	c.order_id,
+	c.special_id,
+	c.pizza_id,
+	string_agg(c.i_count, ', ') as result
+from i_count c
+group by c.order_id,c.special_id,c.pizza_id
+----- Another
+----- Creat Extras
+DROP TABLE IF EXISTS extras
+SELECT		
+      c.special_id,
+      TRIM(e.value) AS topping_id
+INTO extras
+FROM temp_customer_orders as c
+	    CROSS APPLY string_split(c.extras_cleaned, ',') as e;
+---Create Exclusions
+DROP TABLE IF EXISTS exclusions
+SELECT		
+      c.special_id,
+      TRIM(e.value) AS topping_id
+INTO exclusions
+FROM temp_customer_orders as c
+	    CROSS APPLY string_split(c.exclusions_cleaned, ',') as e;
+-----------
+
+WITH CTE_Ingredient as(
+SELECT special_id,
+       pizza_name,
+       CASE WHEN p1.topping_id in (
+                                    SELECT topping_id
+                                    FROM extras e
+                                    WHERE C.special_id = e.special_id
+                                                 ) 
+			THEN '2x' + p1.topping_name
+            ELSE p1.topping_name
+       END AS topping
+FROM temp_customer_orders c 
+LEFT JOIN pizza_recipes_name p1 ON c.pizza_id = p1.pizza_id
+WHERE p1.topping_id NOT IN (SELECT topping_id 
+							FROM exclusions e
+							WHERE e.special_id = c.special_id)
+)
+SELECT special_id, 
+		
+      CONCAT(pizza_name +':' ,STRING_AGG(topping, ',' ) WITHIN GROUP (ORDER BY topping ASC)) AS ingredient_list
+FROM CTE_Ingredient
+GROUP BY  special_id,pizza_name
+ORDER BY special_id;
+
+
+---What is the total quantity of each ingredient used 
+---in all delivered pizzas sorted by most frequent first?
+WITH CTE_ingredient as 
+(SELECT
+	order_id,
+	special_id,
+	pizza_name,
+	topping_name,
+    CASE WHEN p1.topping_id in (
+                                 SELECT topping_id
+                                 FROM extras e
+                                 WHERE C.special_id = e.special_id
+                                                 ) 
+	THEN 2
+    ELSE 1
+    END AS times_used_topping
+FROM temp_customer_orders c 
+LEFT JOIN pizza_recipes_name p1 ON c.pizza_id = p1.pizza_id
+WHERE p1.topping_id NOT IN (SELECT topping_id 
+							FROM exclusions e
+							WHERE e.special_id = c.special_id)
+)
+select topping_name ,SUM(times_used_topping) as total_used
+from CTE_ingredient i
+left join temp_runner_orders r on i.order_id = r.order_id
+where r.cancellation is null
+group by topping_name
+order by sum(times_used_topping) desc
+
+---D. Pricing and Ratings
+---1. If a Meat Lovers pizza costs 12 and Vegetarian costs 10 and there were no charges for changes 
+--- how much money has Pizza Runner made so far if there are no delivery fees?
+---1.1 how many pizza successfully deliverd -> 1.2 what is the price each -> total
+with CTE_price as(
+select c.order_id, c.pizza_id,
+	case
+		when c.pizza_id = 1 then 12
+		else 10
+	end as money_collected
+from temp_customer_orders c
+left join temp_runner_orders r on c.order_id = r.order_id
+where r.cancellation is null)
+select sum(money_collected) as total_revenue
+from CTE_price
+---  What if there was an additional 1 charge for any pizza extras? (Add cheese is 1 extra)
+WITH CTE_revenue as
+(select 
+	c.order_id, 
+	c.pizza_id, 
+	exclusions_cleaned, 
+	extras_cleaned,
+	case 
+		when c.pizza_id = 1 and extras_cleaned is not null then
+			case
+				when CHARINDEX(',',extras_cleaned)> 0 then 14
+				else 13 
+			end
+		when c.pizza_id = 1 and extras_cleaned is null then 12
+		when c.pizza_id = 2 and extras_cleaned is not null then
+			case
+				when CHARINDEX(',',extras_cleaned)> 0 then 12
+				else 11 end
+		else 10
+	end as revenue
+from temp_customer_orders c
+left join temp_runner_orders r on c.order_id = r.order_id
+where r.cancellation is null
+)
+select  sum(revenue) as total_revenue
+from CTE_revenue
+--- 3. The Pizza Runner team now wants to add an additional ratings system that allows customers to rate their runner, 
+--- how would you design an additional table for this new dataset ?
+--- generate a schema for this new table and insert your own data for ratings for each successful customer order between 1 to 5.
+Drop table if exists ratings;
+create table ratings 
+	(order_id INT,
+	ratings INT);
+insert into ratings (order_id,ratings)
+values
+(1,5),
+(2,3),
+(3,5),
+(4,5),
+(5,3),
+(6,2),
+(7,3),
+(8,2),
+(9,4),
+(10,4); 
+
+select *
+from ratings
+
+---4. Using your newly generated table - can you join all of the information together to form a table which has the following information for successful deliveries?
+customer_id
+order_id
+runner_id
+rating
+order_time
+pickup_time
+Time between order and pickup
+Delivery duration
+Average speed
+Total number of pizzas
+
+select 
+	customer_id,
+	c.order_id,
+	runner_id,
+	ratings,
+	order_time,
+	pickup_time_cleaned,
+	datediff(minute, c.order_time,r.pickup_time_cleaned) as time_arrived_minute,
+	duration_mins,
+	round(AVG(distance_km/duration_mins*60),2) as speed,
+	count(pizza_id) as pizza_count
+from temp_customer_orders c
+left join temp_runner_orders r on c.order_id = r.order_id
+left join ratings s on c.order_id = s.order_id
+where r.cancellation is null
+group by customer_id,
+	c.order_id,
+	runner_id,
+	ratings,
+	order_time,
+	pickup_time_cleaned,
+	datediff(minute, c.order_time,r.pickup_time_cleaned),
+	duration_mins
+
+---If a Meat Lovers pizza costs 12 and Vegetarian costs 10, with cost for extras
+---and each runner is paid $0.30 per kilometre traveled
+--- - how much money does Pizza Runner have left over after these deliveries?
+WITH CTE_earn as
+(
+select order_id, sum(revenue) as total_revenue
+from (select 
+		c.order_id, 
+		c.pizza_id, 
+		exclusions_cleaned, 
+		extras_cleaned,
+		case 
+			when c.pizza_id = 1 and extras_cleaned is not null then
+				case
+					when CHARINDEX(',',extras_cleaned)> 0 then 14
+					else 13 
+				end
+			when c.pizza_id = 1 and extras_cleaned is null then 12
+			when c.pizza_id = 2 and extras_cleaned is not null then
+				case
+					when CHARINDEX(',',extras_cleaned)> 0 then 12
+					else 11 end
+			else 10
+		end as revenue
+	from temp_customer_orders c
+	left join temp_runner_orders r on c.order_id = r.order_id
+	where r.cancellation is null) as subquery
+group by order_id
+), 
+CTE_cost as
+(select order_id, distance_km, (distance_km*0.30) as cost
+from temp_runner_orders)
+select (sum(total_revenue) - sum(cost)) as actual_collected
+from CTE_earn e
+left join CTE_cost c on e.order_id = c.order_id
+where cost is not null
